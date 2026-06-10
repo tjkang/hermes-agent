@@ -6154,6 +6154,82 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Harunyang recurring-log callbacks (haru_log:kind:choice) ---
+        if data.startswith("haru_log:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer(text="Invalid Haru log data.")
+                return
+
+            kind, choice = parts[1], parts[2]
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                return
+
+            callback_texts = {
+                ("breakfast", "default"): "응, 기본 먹었어 ✅",
+                ("breakfast", "custom"): "다르게 먹었어 ✏️",
+            }
+            resolved_text = callback_texts.get((kind, choice))
+            if not resolved_text:
+                await query.answer(text="Unknown Haru log action.")
+                return
+
+            await query.answer(text="✓ 확인했어")
+            user_display = getattr(query.from_user, "first_name", "User")
+            try:
+                original_text = (query.message.text or "") if query.message else ""
+                await query.edit_message_text(
+                    text=f"{_html.escape(original_text)}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}",
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
+            if not query.message:
+                return
+
+            # Convert the callback into a normal text MessageEvent so existing
+            # skills/logging flows handle it exactly like TJ typed the button
+            # label, without leaving a persistent Telegram reply keyboard.
+            try:
+                from types import SimpleNamespace
+
+                callback_message = SimpleNamespace(
+                    chat=query.message.chat,
+                    from_user=query.from_user,
+                    text=resolved_text,
+                    message_id=getattr(query.message, "message_id", None),
+                    message_thread_id=getattr(query.message, "message_thread_id", None),
+                    is_topic_message=getattr(query.message, "is_topic_message", False),
+                    reply_to_message=None,
+                    quote=None,
+                    date=datetime.now(timezone.utc),
+                    forum_topic_created=None,
+                )
+                event = self._build_message_event(callback_message, MessageType.TEXT)
+                event = self._apply_telegram_group_observe_attribution(event)
+                await self.handle_message(event)
+            except Exception as exc:
+                logger.error("[%s] Haru log callback failed: %s", self.name, exc, exc_info=True)
+                try:
+                    if self._bot is not None:
+                        await self._bot.send_message(
+                            chat_id=int(query.message.chat_id),
+                            text="버튼 처리가 실패했어. 같은 문구를 채팅으로 한번만 보내줘 🙏",
+                        )
+                except Exception:
+                    pass
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
