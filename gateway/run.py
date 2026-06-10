@@ -23697,6 +23697,23 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _start_heartbeat_bumper(stop_event: threading.Event, hb_file: "Path", interval: int = 30):
+    """Touch .gateway.heartbeat every ~30s so health monitors can confirm the event loop is alive."""
+    try:
+        hb_file.parent.mkdir(parents=True, exist_ok=True)
+        hb_file.touch(exist_ok=True)
+    except Exception as e:
+        logger.debug("Heartbeat init error: %s", e)
+    while not stop_event.is_set():
+        stop_event.wait(timeout=interval)
+        if stop_event.is_set():
+            break
+        try:
+            hb_file.touch(exist_ok=True)
+        except Exception as e:
+            logger.debug("Heartbeat bump error: %s", e)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -24230,6 +24247,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     cron_thread.start()
 
+    # Start heartbeat bumper so PAI health-check can detect event-loop hangs.
+    hb_stop = threading.Event()
+    hb_file = _hermes_home / "cron" / ".gateway.heartbeat"
+    hb_thread = threading.Thread(
+        target=_start_heartbeat_bumper,
+        args=(hb_stop, hb_file),
+        daemon=True,
+        name="gateway-heartbeat",
+    )
+    hb_thread.start()
+
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
     # Shares cron_stop as the shutdown signal.
@@ -24286,6 +24314,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
+
+    hb_stop.set()
+    hb_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
