@@ -23703,8 +23703,11 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
-def _start_heartbeat_bumper(stop_event: threading.Event, hb_file: "Path", interval: int = 30):
-    """Touch .gateway.heartbeat every ~30s so health monitors can confirm the event loop is alive."""
+def _start_heartbeat_bumper(stop_event: threading.Event, hb_file: "Path", interval: int = 30, loop_alive=None):
+    """Touch .gateway.heartbeat every ~30s while the event loop is provably alive.
+
+    loop_alive: optional callable returning False when the asyncio event loop has
+    stopped beating — without it a hung loop would still look healthy to monitors."""
     try:
         hb_file.parent.mkdir(parents=True, exist_ok=True)
         hb_file.touch(exist_ok=True)
@@ -23715,6 +23718,9 @@ def _start_heartbeat_bumper(stop_event: threading.Event, hb_file: "Path", interv
         if stop_event.is_set():
             break
         try:
+            if loop_alive is not None and not loop_alive():
+                logger.debug("Heartbeat skipped: event loop not beating")
+                continue
             hb_file.touch(exist_ok=True)
         except Exception as e:
             logger.debug("Heartbeat bump error: %s", e)
@@ -24254,11 +24260,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread.start()
 
     # Start heartbeat bumper so PAI health-check can detect event-loop hangs.
+    # An asyncio task refreshes _last_loop_beat; the bumper thread only touches
+    # the heartbeat file while the loop beat is fresh (<90s), so a hung event
+    # loop stops the heartbeat instead of masquerading as healthy.
     hb_stop = threading.Event()
     hb_file = _hermes_home / "cron" / ".gateway.heartbeat"
+    _last_loop_beat = [time.time()]
+
+    async def _loop_beat_refresher():
+        while True:
+            _last_loop_beat[0] = time.time()
+            await asyncio.sleep(15)
+
+    _loop_beat_task = asyncio.get_running_loop().create_task(_loop_beat_refresher())
     hb_thread = threading.Thread(
         target=_start_heartbeat_bumper,
         args=(hb_stop, hb_file),
+        kwargs={"loop_alive": lambda: (time.time() - _last_loop_beat[0]) < 90},
         daemon=True,
         name="gateway-heartbeat",
     )
@@ -24296,6 +24314,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+        _loop_beat_task.cancel()
+        hb_stop.set()
         return False
     
     # Stop cron scheduler + housekeeping cleanly.
@@ -24321,6 +24341,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
 
+    _loop_beat_task.cancel()
     hb_stop.set()
     hb_thread.join(timeout=5)
 
