@@ -131,6 +131,34 @@ def test_kanban_notifier_formats_completed_message_for_mobile_reading(tmp_path, 
     assert "승인: 필요" in text
     assert "다음: TJ가 preview.mp4 확인 후 승인" in text
     assert "인계: ops" in text
+    assert "TJ 액션: TJ가 preview.mp4 확인 후 승인" in text
+
+
+def test_kanban_notifier_formats_blocked_message_with_tj_action(tmp_path, monkeypatch):
+    db_path = tmp_path / "blocked-readable-format.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="approval gate", assignee="ops")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason="preview 확인 후 진행 여부를 답해주세요")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "Kanban 차단 (blocked)" in text
+    assert f"ID: {tid}" in text
+    assert "작업: approval gate" in text
+    assert "사유: preview 확인 후 진행 여부를 답해주세요" in text
+    assert "TJ 액션: preview 확인 후 진행 여부를 답해주세요" in text
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
