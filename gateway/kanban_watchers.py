@@ -165,6 +165,18 @@ def _kanban_yes_no(value: str) -> str:
     return _kanban_truncate(value, 80)
 
 
+def _kanban_truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {
+        "true",
+        "yes",
+        "y",
+        "1",
+        "needed",
+        "required",
+        "필요",
+    }
+
+
 def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Optional[dict]) -> str:
     task_id = sub.get("task_id") or (task.id if task else "")
     title = _kanban_truncate((task.title if task else task_id) or task_id, 120)
@@ -208,6 +220,9 @@ def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Op
             lines.append(f"다음: {fields['next_action']}")
         if fields.get("handoff_to") and fields["handoff_to"].lower() != "none":
             lines.append(f"인계: {fields['handoff_to']}")
+        if _kanban_truthy(fields.get("approval_needed", "")):
+            action = fields.get("next_action") or "승인/확인 필요"
+            lines.append(f"TJ 액션: {action}")
     elif kind == "blocked":
         reason = ""
         if isinstance(event_payload, dict) and event_payload.get("reason"):
@@ -219,6 +234,8 @@ def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Op
             lines.append(f"다음: {fields['next_action']}")
         elif fields.get("approval_needed"):
             lines.append(f"승인: {_kanban_yes_no(fields['approval_needed'])}")
+        action = fields.get("next_action") or reason or "확인/입력 필요"
+        lines.append(f"TJ 액션: {_kanban_truncate(action, 220)}")
     elif kind == "status":
         new_status = ""
         if isinstance(event_payload, dict) and event_payload.get("status"):
