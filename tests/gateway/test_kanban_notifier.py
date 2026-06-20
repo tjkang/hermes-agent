@@ -105,6 +105,34 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
     assert adapter2.sent == []
 
 
+def test_kanban_notifier_formats_completed_message_for_mobile_reading(tmp_path, monkeypatch):
+    db_path = tmp_path / "readable-format.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    summary = (
+        "승인용 렌더 패키지 준비 완료. "
+        "approval_needed=true; next_action=TJ가 preview.mp4 확인 후 승인; handoff_to=ops"
+    )
+    tid = _create_completed_subscription(summary=summary)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "Kanban 완료 (completed)" in text
+    assert f"ID: {tid}" in text
+    assert "담당: @worker" in text
+    assert "작업: notify once" in text
+    assert "요약: 승인용 렌더 패키지 준비 완료." in text
+    assert "승인: 필요" in text
+    assert "다음: TJ가 preview.mp4 확인 후 승인" in text
+    assert "인계: ops" in text
+
+
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
     db_path = tmp_path / "adapter-disconnect.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

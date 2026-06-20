@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -107,6 +108,139 @@ def _release_singleton_lock(handle) -> None:
         handle.close()
     except Exception:
         pass
+
+
+def _kanban_truncate(text: str, limit: int = 220) -> str:
+    text = " ".join(str(text or "").strip().split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _kanban_first_line(text: str, limit: int = 220) -> str:
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if line:
+            return _kanban_truncate(line, limit)
+    return ""
+
+
+def _kanban_duration_label(seconds: Optional[int]) -> str:
+    if seconds is None or seconds < 0:
+        return ""
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s" if sec else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+
+
+def _kanban_summary_fields(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    wanted = {
+        "approval_needed",
+        "next_action",
+        "handoff_to",
+        "blocked_reason",
+    }
+    for match in re.finditer(
+        r"\b(approval_needed|next_action|handoff_to|blocked_reason)\s*[:=]\s*([^;\n]+)",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ):
+        key = match.group(1).lower()
+        if key in wanted:
+            out[key] = _kanban_truncate(match.group(2).strip().rstrip("."), 180)
+    return out
+
+
+def _kanban_yes_no(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "yes", "y", "1", "needed", "required"}:
+        return "필요"
+    if normalized in {"false", "no", "n", "0", "none", "null"}:
+        return "없음"
+    return _kanban_truncate(value, 80)
+
+
+def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Optional[dict]) -> str:
+    task_id = sub.get("task_id") or (task.id if task else "")
+    title = _kanban_truncate((task.title if task else task_id) or task_id, 120)
+    assignee = task.assignee if task and task.assignee else None
+    who = f"@{assignee}" if assignee else "미지정"
+    elapsed = ""
+    if task and getattr(task, "completed_at", None):
+        started = getattr(task, "started_at", None) or getattr(task, "created_at", None)
+        if started:
+            elapsed = _kanban_duration_label(int(task.completed_at) - int(started))
+
+    summary = ""
+    if isinstance(event_payload, dict) and event_payload.get("summary"):
+        summary = str(event_payload.get("summary") or "")
+    elif task and getattr(task, "result", None):
+        summary = str(task.result or "")
+    summary_line = _kanban_first_line(summary, 240)
+    fields = _kanban_summary_fields(summary)
+
+    header_by_kind = {
+        "completed": "✅ Kanban 완료 (completed)",
+        "blocked": "⏸ Kanban 차단 (blocked)",
+        "gave_up": "❌ Kanban 실패 (gave up)",
+        "crashed": "💥 Kanban 오류 (crashed)",
+        "timed_out": "⏱ Kanban 시간초과 (timed out)",
+        "status": "🔄 Kanban 상태변경 (status)",
+    }
+    lines = [header_by_kind.get(kind, f"Kanban {kind}")]
+    lines.append(f"작업: {title}")
+    id_line = f"ID: {task_id} · 담당: {who}"
+    if elapsed:
+        id_line += f" · 소요: {elapsed}"
+    lines.append(id_line)
+
+    if kind == "completed":
+        if summary_line:
+            lines.append(f"요약: {summary_line}")
+        if fields.get("approval_needed"):
+            lines.append(f"승인: {_kanban_yes_no(fields['approval_needed'])}")
+        if fields.get("next_action"):
+            lines.append(f"다음: {fields['next_action']}")
+        if fields.get("handoff_to") and fields["handoff_to"].lower() != "none":
+            lines.append(f"인계: {fields['handoff_to']}")
+    elif kind == "blocked":
+        reason = ""
+        if isinstance(event_payload, dict) and event_payload.get("reason"):
+            reason = str(event_payload["reason"])
+        reason = reason or fields.get("blocked_reason") or summary_line
+        if reason:
+            lines.append(f"사유: {_kanban_truncate(reason, 240)}")
+        if fields.get("next_action"):
+            lines.append(f"다음: {fields['next_action']}")
+        elif fields.get("approval_needed"):
+            lines.append(f"승인: {_kanban_yes_no(fields['approval_needed'])}")
+    elif kind == "status":
+        new_status = ""
+        if isinstance(event_payload, dict) and event_payload.get("status"):
+            new_status = str(event_payload["status"])
+        lines.append(f"상태: {new_status or '상태 변경'}")
+    elif kind == "gave_up":
+        error = ""
+        if isinstance(event_payload, dict) and event_payload.get("error"):
+            error = str(event_payload["error"])
+        lines.append("상태: 반복 실행 실패로 중단")
+        if error:
+            lines.append(f"원인: {_kanban_truncate(error, 240)}")
+    elif kind == "crashed":
+        lines.append("상태: worker process 종료, dispatcher가 재시도 예정")
+    elif kind == "timed_out":
+        limit = ""
+        if isinstance(event_payload, dict) and event_payload.get("limit_seconds"):
+            limit = _kanban_duration_label(int(event_payload["limit_seconds"]))
+        lines.append(f"상태: 제한시간 초과, 재시도 예정{f' ({limit})' if limit else ''}")
+
+    return "\n".join(lines)
+
 
 
 class GatewayKanbanWatchersMixin:
@@ -346,73 +480,14 @@ class GatewayKanbanWatchersMixin:
                     )
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
-                        else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                        if kind not in TERMINAL_KINDS or kind in {"archived", "unblocked"}:
                             continue
+                        msg = _format_kanban_notification(
+                            kind,
+                            sub=sub,
+                            task=task,
+                            event_payload=getattr(ev, "payload", None),
+                        )
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
