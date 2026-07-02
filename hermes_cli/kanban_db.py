@@ -4759,6 +4759,13 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+            # Copywriting / approval-artifact tasks store the actual user-facing
+            # package in metadata. Promote a small allowlist to the completed
+            # event so Telegram notifications can include the deliverable
+            # instead of a status-only summary.
+            for key in ("deliverable", "recommended", "alternatives"):
+                if key in metadata and metadata.get(key) not in (None, "", [], {}):
+                    completed_payload[key] = metadata[key]
         _append_event(
             conn, task_id, "completed",
             completed_payload,

@@ -10,9 +10,27 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.image_batches = []
+        self.videos = []
+        self.documents = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    def extract_local_files(self, text):
+        import re
+
+        paths = re.findall(r"/[^\s,;\])}]+", text or "")
+        return paths, text
+
+    async def send_multiple_images(self, chat_id, images, metadata=None):
+        self.image_batches.append({"chat_id": chat_id, "images": images, "metadata": metadata or {}})
+
+    async def send_video(self, chat_id, video_path, metadata=None):
+        self.videos.append({"chat_id": chat_id, "video_path": video_path, "metadata": metadata or {}})
+
+    async def send_document(self, chat_id, file_path, metadata=None):
+        self.documents.append({"chat_id": chat_id, "file_path": file_path, "metadata": metadata or {}})
 
 
 class DisconnectedAdapters(dict):
@@ -126,12 +144,54 @@ def test_kanban_notifier_formats_completed_message_for_mobile_reading(tmp_path, 
     assert "Kanban 완료 (completed)" in text
     assert f"ID: {tid}" in text
     assert "담당: @worker" in text
+    assert "현재: done" in text
     assert "작업: notify once" in text
     assert "요약: 승인용 렌더 패키지 준비 완료." in text
     assert "승인: 필요" in text
     assert "다음: TJ가 preview.mp4 확인 후 승인" in text
     assert "인계: ops" in text
     assert "TJ 액션: TJ가 preview.mp4 확인 후 승인" in text
+
+
+def test_kanban_notifier_completed_message_surfaces_copywriting_payload(tmp_path, monkeypatch):
+    db_path = tmp_path / "copywriting-payload-format.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="pinned comment package", assignee="ops")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn,
+            tid,
+            summary="핀댓글 패키지 완료. approval_needed=true; next_action=TJ 승인 후 업로드 메타 반영",
+            metadata={
+                "recommended": "오늘의 추천 핀댓글: 삭제해도 괜찮은 파일과 안 되는 파일, 여러분 기준은?",
+                "alternatives": [
+                    "대안 1: 이 장면 공감되면 저장해두세요.",
+                    "대안 2: 개발냥처럼 확인하고 지우는 습관이 제일 안전합니다.",
+                    "대안 3: 다음 편에서는 캐시/빌드 산출물 구분법을 다룹니다.",
+                    "대안 4: 여러분의 삭제 전 체크리스트는 무엇인가요?",
+                ],
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "Kanban 완료 (completed)" in text
+    assert "추천안: 오늘의 추천 핀댓글" in text
+    assert "대안:" in text
+    assert "1. 대안 1:" in text
+    assert "4. 대안 4:" in text
+    assert "TJ 액션: TJ 승인 후 업로드 메타 반영" in text
 
 
 def test_kanban_notifier_formats_blocked_message_with_tj_action(tmp_path, monkeypatch):
@@ -156,9 +216,109 @@ def test_kanban_notifier_formats_blocked_message_with_tj_action(tmp_path, monkey
     text = adapter.sent[0]["text"]
     assert "Kanban 차단 (blocked)" in text
     assert f"ID: {tid}" in text
+    assert "담당: 척척냥(@ops)" in text
+    assert "현재: blocked" in text
     assert "작업: approval gate" in text
+    assert "상태: 차단 (blocked)" in text
     assert "사유: preview 확인 후 진행 여부를 답해주세요" in text
-    assert "TJ 액션: preview 확인 후 진행 여부를 답해주세요" in text
+    assert "필요한 TJ 액션: preview 확인 후 진행 여부를 답해주세요" in text
+
+
+def test_kanban_notifier_formats_review_required_block_as_approval_waiting(tmp_path, monkeypatch):
+    db_path = tmp_path / "review-required-readable-format.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    reason = (
+        "review-required: Remotion 승인 템플릿 proof generated; "
+        "completed=90초 proof 생성 완료; "
+        "next_action=review-required: Remotion 승인 템플릿 proof generated; "
+        "artifacts=/tmp/proof.mp4, /tmp/thumb.jpg"
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t_f72d8c65 style approval", assignee="ops")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason=reason)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "Kanban 승인대기 (blocked)" in text
+    assert f"ID: {tid}" in text
+    assert "담당: 척척냥(@ops)" in text
+    assert "현재: blocked" in text
+    assert "상태: 승인대기 (내부 상태: blocked)" in text
+    assert "완료된 것: 90초 proof 생성 완료" in text
+    assert "필요한 TJ 액션: 첨부된 90초 proof 확인 후 승인/수정 요청" in text
+    assert "다음 단계: TJ 승인/피드백 후 작업 재개" in text
+    assert "산출물: 2개 · /tmp/proof.mp4 외 1개" in text
+    assert "사유:" not in text
+    assert "TJ 액션: review-required:" not in text
+
+
+def test_kanban_notifier_review_required_block_uploads_comment_artifact_to_thread(tmp_path, monkeypatch):
+    db_path = tmp_path / "review-required-artifact.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    proof = tmp_path / "proof.png"
+    proof.write_bytes(b"fake png")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked proof artifact", assignee="ops")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+        )
+        kb.add_comment(conn, tid, "ops", f"review handoff qa_artifacts: {proof}")
+        kb.block_task(conn, tid, reason="review-required: 90초 proof 생성 완료")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"] == {"thread_id": "2"}
+    assert len(adapter.image_batches) == 1
+    assert adapter.image_batches[0]["metadata"] == {"thread_id": "2"}
+    assert str(proof) in adapter.image_batches[0]["images"][0][0]
+
+
+def test_kanban_notifier_review_required_extracts_full_render_next_step(tmp_path, monkeypatch):
+    db_path = tmp_path / "review-required-full-render.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    reason = "review-required: 90초 proof 완료. 승인 시 full 51:19 렌더"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="full render approval", assignee="ops")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason=reason)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    text = adapter.sent[0]["text"]
+    assert "필요한 TJ 액션: 첨부된 90초 proof 확인 후 승인/수정 요청" in text
+    assert "다음 단계: 승인 시 full 51:19 렌더" in text
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
