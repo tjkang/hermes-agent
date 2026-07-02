@@ -141,12 +141,16 @@ def _kanban_summary_fields(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
     wanted = {
         "approval_needed",
+        "artifacts",
+        "completed",
+        "completed_work",
+        "done",
         "next_action",
         "handoff_to",
         "blocked_reason",
     }
     for match in re.finditer(
-        r"\b(approval_needed|next_action|handoff_to|blocked_reason)\s*[:=]\s*([^;\n]+)",
+        r"\b(approval_needed|artifacts|completed|completed_work|done|next_action|handoff_to|blocked_reason)\s*[:=]\s*([^;\n]+)",
         str(text or ""),
         flags=re.IGNORECASE,
     ):
@@ -177,11 +181,176 @@ def _kanban_truthy(value: str) -> bool:
     }
 
 
+_KANBAN_ASSIGNEE_LABELS = {
+    "ops": "척척냥",
+    "orchestrator": "대장냥",
+    "daily": "하루냥",
+    "piknyang": "픽냥",
+    "pkm": "지식냥",
+    "dev": "뚝딱냥",
+}
+
+
+def _kanban_assignee_label(assignee: Optional[str]) -> str:
+    if not assignee:
+        return "미지정"
+    korean = _KANBAN_ASSIGNEE_LABELS.get(str(assignee).strip().lower())
+    return f"{korean}(@{assignee})" if korean else f"@{assignee}"
+
+
+def _kanban_is_review_required(reason: str, fields: dict[str, str]) -> bool:
+    reason_norm = str(reason or "").strip().lower()
+    if reason_norm.startswith("review-required:"):
+        return True
+    approval = fields.get("approval_needed", "")
+    return _kanban_truthy(approval) and "review" in reason_norm
+
+
+def _kanban_strip_review_prefix(reason: str) -> str:
+    return re.sub(
+        r"^\s*review-required\s*:\s*",
+        "",
+        str(reason or ""),
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _kanban_review_action(reason: str, fields: dict[str, str]) -> str:
+    action = fields.get("next_action", "").strip()
+    raw_without_prefix = _kanban_strip_review_prefix(reason)
+    # The old formatter often duplicated the whole raw reason as TJ action.
+    # Only trust an explicit next_action when it is not just the review label
+    # and payload repeated verbatim.
+    if (
+        action
+        and not action.lower().startswith("review-required:")
+        and action.lower()
+        not in {
+            str(reason or "").strip().lower(),
+            raw_without_prefix.lower(),
+        }
+    ):
+        return action
+    target = "proof/preview"
+    lowered = raw_without_prefix.lower()
+    if "90초" in raw_without_prefix or "90s" in lowered or "90 sec" in lowered:
+        target = "90초 proof"
+    elif "preview" in lowered or "프리뷰" in raw_without_prefix:
+        target = "preview"
+    elif "proof" in lowered or "승인" in raw_without_prefix:
+        target = "proof"
+    return f"첨부된 {target} 확인 후 승인/수정 요청"
+
+
+def _kanban_next_step_for_review(reason: str, fields: dict[str, str]) -> str:
+    explicit = fields.get("next_action", "").strip()
+    raw_without_prefix = _kanban_strip_review_prefix(reason)
+    if (
+        explicit
+        and not explicit.lower().startswith("review-required:")
+        and explicit.lower()
+        not in {
+            str(reason or "").strip().lower(),
+            raw_without_prefix.lower(),
+        }
+    ):
+        return explicit
+    match = re.search(
+        r"full\s*([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)\s*렌더",
+        raw_without_prefix,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return f"승인 시 full {match.group(1)} 렌더"
+    return "TJ 승인/피드백 후 작업 재개"
+
+
+def _kanban_artifact_hint(event_payload: Optional[dict], fields: dict[str, str]) -> str:
+    artifacts: list[str] = []
+    if isinstance(event_payload, dict):
+        raw = event_payload.get("artifacts")
+        if isinstance(raw, (list, tuple)):
+            artifacts.extend(str(p).strip() for p in raw if str(p).strip())
+    if fields.get("artifacts"):
+        artifacts.extend(p.strip() for p in re.split(r",\s*", fields["artifacts"]) if p.strip())
+    if not artifacts:
+        return "별도 첨부/요약 참조"
+    first = _kanban_truncate(artifacts[0], 140)
+    suffix = f" 외 {len(artifacts) - 1}개" if len(artifacts) > 1 else ""
+    return f"{len(artifacts)}개 · {first}{suffix}"
+
+
+def _kanban_render_payload_value(value: Any, *, limit: int = 900) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _kanban_truncate(value, limit)
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        rendered = []
+        for idx, item in enumerate(value[:8], start=1):
+            text = _kanban_render_payload_value(item, limit=260)
+            if text:
+                rendered.append(f"{idx}. {text}")
+        if len(value) > 8:
+            rendered.append(f"…외 {len(value) - 8}개")
+        return "\n".join(rendered)
+    if isinstance(value, dict):
+        rendered = []
+        for key, item in value.items():
+            text = _kanban_render_payload_value(item, limit=260)
+            if text:
+                rendered.append(f"- {key}: {text}")
+        return "\n".join(rendered)
+    return _kanban_truncate(str(value), limit)
+
+
+def _kanban_completed_payload_lines(event_payload: Optional[dict]) -> list[str]:
+    """Render user-facing deliverable metadata for completed notifications.
+
+    Copywriting / approval-artifact tasks often put the actual package in
+    run metadata (``deliverable``, ``recommended``, ``alternatives``). A
+    status-only Telegram notification is a failure for those tasks, so the
+    completion event promotes those fields here and we surface them directly.
+    """
+    if not isinstance(event_payload, dict):
+        return []
+    labels = [
+        ("deliverable", "산출물"),
+        ("recommended", "추천안"),
+        ("alternatives", "대안"),
+    ]
+    lines: list[str] = []
+    for key, label in labels:
+        if key not in event_payload:
+            continue
+        rendered = _kanban_render_payload_value(event_payload.get(key))
+        if rendered:
+            lines.append(f"{label}: {rendered}")
+    return lines
+
+
+def _kanban_event_is_review_required(event_payload: Optional[dict], task) -> bool:
+    summary = ""
+    if isinstance(event_payload, dict) and event_payload.get("summary"):
+        summary = str(event_payload.get("summary") or "")
+    elif task and getattr(task, "result", None):
+        summary = str(task.result or "")
+    fields = _kanban_summary_fields(summary)
+    reason = ""
+    if isinstance(event_payload, dict) and event_payload.get("reason"):
+        reason = str(event_payload["reason"])
+    reason = reason or fields.get("blocked_reason") or _kanban_first_line(summary, 240)
+    merged_fields = {**fields, **_kanban_summary_fields(reason)}
+    return _kanban_is_review_required(reason, merged_fields)
+
+
 def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Optional[dict]) -> str:
     task_id = sub.get("task_id") or (task.id if task else "")
     title = _kanban_truncate((task.title if task else task_id) or task_id, 120)
     assignee = task.assignee if task and task.assignee else None
-    who = f"@{assignee}" if assignee else "미지정"
+    who = _kanban_assignee_label(assignee)
     elapsed = ""
     if task and getattr(task, "completed_at", None):
         started = getattr(task, "started_at", None) or getattr(task, "created_at", None)
@@ -207,6 +376,8 @@ def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Op
     lines = [header_by_kind.get(kind, f"Kanban {kind}")]
     lines.append(f"작업: {title}")
     id_line = f"ID: {task_id} · 담당: {who}"
+    if task and getattr(task, "status", None):
+        id_line += f" · 현재: {task.status}"
     if elapsed:
         id_line += f" · 소요: {elapsed}"
     lines.append(id_line)
@@ -214,6 +385,7 @@ def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Op
     if kind == "completed":
         if summary_line:
             lines.append(f"요약: {summary_line}")
+        lines.extend(_kanban_completed_payload_lines(event_payload))
         if fields.get("approval_needed"):
             lines.append(f"승인: {_kanban_yes_no(fields['approval_needed'])}")
         if fields.get("next_action"):
@@ -228,14 +400,38 @@ def _format_kanban_notification(kind: str, *, sub: dict, task, event_payload: Op
         if isinstance(event_payload, dict) and event_payload.get("reason"):
             reason = str(event_payload["reason"])
         reason = reason or fields.get("blocked_reason") or summary_line
-        if reason:
-            lines.append(f"사유: {_kanban_truncate(reason, 240)}")
-        if fields.get("next_action"):
-            lines.append(f"다음: {fields['next_action']}")
-        elif fields.get("approval_needed"):
-            lines.append(f"승인: {_kanban_yes_no(fields['approval_needed'])}")
-        action = fields.get("next_action") or reason or "확인/입력 필요"
-        lines.append(f"TJ 액션: {_kanban_truncate(action, 220)}")
+        reason_fields = _kanban_summary_fields(reason)
+        merged_fields = {**fields, **reason_fields}
+        review_required = _kanban_is_review_required(reason, merged_fields)
+        if review_required:
+            lines[0] = "⏸ Kanban 승인대기 (blocked)"
+            clean_reason = _kanban_strip_review_prefix(reason)
+            lines.append("상태: 승인대기 (내부 상태: blocked)")
+            completed = (
+                merged_fields.get("completed")
+                or merged_fields.get("completed_work")
+                or merged_fields.get("done")
+                or clean_reason
+            )
+            if completed:
+                lines.append(f"완료된 것: {_kanban_truncate(completed, 220)}")
+            lines.append(
+                f"필요한 TJ 액션: {_kanban_truncate(_kanban_review_action(reason, merged_fields), 220)}"
+            )
+            lines.append(
+                f"다음 단계: {_kanban_truncate(_kanban_next_step_for_review(reason, merged_fields), 220)}"
+            )
+            lines.append(f"산출물: {_kanban_artifact_hint(event_payload, merged_fields)}")
+        else:
+            lines.append("상태: 차단 (blocked)")
+            if reason:
+                lines.append(f"사유: {_kanban_truncate(reason, 240)}")
+            if merged_fields.get("next_action"):
+                lines.append(f"다음 단계: {merged_fields['next_action']}")
+            elif merged_fields.get("approval_needed"):
+                lines.append(f"승인: {_kanban_yes_no(merged_fields['approval_needed'])}")
+            action = merged_fields.get("next_action") or reason or "확인/입력 필요"
+            lines.append(f"필요한 TJ 액션: {_kanban_truncate(action, 220)}")
     elif kind == "status":
         new_status = ""
         if isinstance(event_payload, dict) and event_payload.get("status"):
@@ -430,6 +626,7 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                comments = _kb.list_comments(conn, sub["task_id"])
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -440,6 +637,7 @@ class GatewayKanbanWatchersMixin:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "comments": comments,
                                     "board": slug,
                                 })
                         finally:
@@ -564,7 +762,12 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" or (
+                                kind == "blocked"
+                                and _kanban_event_is_review_required(
+                                    getattr(ev, "payload", None), task
+                                )
+                            ):
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
@@ -572,6 +775,7 @@ class GatewayKanbanWatchersMixin:
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
+                                        comments=d.get("comments") or [],
                                     )
                                 except Exception as art_exc:
                                     logger.debug(
@@ -853,6 +1057,7 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
+        comments: Optional[list] = None,
     ) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
@@ -901,7 +1106,19 @@ class GatewayKanbanWatchersMixin:
                 for p in paths:
                     _add(p)
 
-        # 3. Legacy: paths embedded in task.result.
+        # 3. Review-required blocked tasks often put approval artifacts in
+        # handoff comments instead of task.result. Scan comments only when the
+        # caller opted in (the watcher passes comments for completed and
+        # review-required blocked events), so ordinary blocks do not spam files.
+        for comment in comments or []:
+            body = getattr(comment, "body", "")
+            if not body:
+                continue
+            paths, _ = adapter.extract_local_files(str(body))
+            for p in paths:
+                _add(p)
+
+        # 4. Legacy: paths embedded in task.result.
         if task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
