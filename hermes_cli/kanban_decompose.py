@@ -268,6 +268,50 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _inherit_notify_subs(conn, root_id: str, child_ids: list[str]) -> int:
+    """Copy the root task's notify subscriptions onto its decompose children.
+
+    Auto-decompose runs in a bare DB connection with no gateway session
+    context, so ``kanban_tools._maybe_auto_subscribe`` never fires for the
+    children and their terminal events (blocked / gave_up) would be
+    delivered nowhere. Copy the root's subscriptions so any channel that
+    asked to hear about the root also hears about its children.
+
+    Best-effort and idempotent: ``add_notify_sub`` is INSERT OR IGNORE on
+    (task_id, platform, chat_id, thread_id), so re-runs never duplicate and
+    the child cursor starts fresh (``last_event_id`` defaults to 0, so no
+    stale root events are re-delivered). Any failure is logged at WARNING
+    and swallowed — notification bookkeeping must never fail the
+    decomposition itself. Returns the number of subscription rows written.
+    """
+    if not child_ids:
+        return 0
+    try:
+        root_subs = kb.list_notify_subs(conn, task_id=root_id)
+        if not root_subs:
+            return 0
+        copied = 0
+        for child_id in child_ids:
+            for sub in root_subs:
+                kb.add_notify_sub(
+                    conn,
+                    task_id=child_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or None,
+                    user_id=sub.get("user_id"),
+                    notifier_profile=sub.get("notifier_profile"),
+                )
+                copied += 1
+        return copied
+    except Exception as exc:
+        logger.warning(
+            "decompose: notify-sub inheritance failed for root %s: %r",
+            root_id, exc,
+        )
+        return 0
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -448,6 +492,19 @@ def decompose_task(
     if child_ids is None:
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
+        )
+
+    # Inherit the root's notify subscriptions onto the new children so their
+    # terminal events are delivered to whoever was listening to the root.
+    # Fresh connection, best-effort — never let a notification-bookkeeping
+    # failure fail a decomposition that already succeeded.
+    try:
+        with kb.connect_closing() as _sub_conn:
+            _inherit_notify_subs(_sub_conn, task_id, child_ids)
+    except Exception as _exc:
+        logger.warning(
+            "decompose: notify-sub inheritance connection failed for %s: %r",
+            task_id, _exc,
         )
 
     return DecomposeOutcome(
