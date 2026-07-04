@@ -110,6 +110,7 @@ _fake_telegram_request.HTTPXRequest = object
 @pytest.fixture(autouse=True)
 def _inject_fake_telegram(monkeypatch):
     """Inject fake telegram modules so the adapter can import from them."""
+    monkeypatch.delitem(sys.modules, "plugins.platforms.telegram.adapter", raising=False)
     monkeypatch.setitem(sys.modules, "telegram", _fake_telegram)
     monkeypatch.setitem(sys.modules, "telegram.error", _fake_telegram_error)
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
