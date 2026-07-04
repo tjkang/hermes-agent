@@ -683,6 +683,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        # Config-driven callback-to-text routes (extra.callback_text_routes):
+        # maps exact inline-keyboard callback_data strings to text injected as
+        # if the tapping user typed it.
+        self._callback_text_routes: Dict[str, str] = self._parse_callback_text_routes()
         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
         # path degrades (tables → bullet lists, task lists, <details>, block
         # math) via sendRichMessage / editMessageText's rich_message param using
@@ -1477,6 +1481,101 @@ class TelegramAdapter(BasePlatformAdapter):
         if max_value is not None:
             parsed = min(parsed, max_value)
         return parsed
+
+    def _parse_callback_text_routes(self) -> Dict[str, str]:
+        """Parse ``extra.callback_text_routes`` into exact callback_data routes."""
+        raw = self.config.extra.get("callback_text_routes") if getattr(self.config, "extra", None) else {}
+        raw = raw or {}
+        if not isinstance(raw, dict):
+            logger.warning(
+                "[%s] callback_text_routes must be a mapping, got %s; ignoring",
+                self.name,
+                type(raw).__name__,
+            )
+            return {}
+
+        routes: Dict[str, str] = {}
+        for key, text in raw.items():
+            if not isinstance(key, str) or not key:
+                logger.warning("[%s] Ignoring callback_text_routes entry with invalid key: %r", self.name, key)
+                continue
+            if not isinstance(text, str) or not text.strip():
+                logger.warning("[%s] Ignoring callback_text_routes entry with invalid text for %r", self.name, key)
+                continue
+            if len(key.encode("utf-8")) > 64:
+                logger.warning(
+                    "[%s] Ignoring callback_text_routes key over Telegram's 64-byte callback_data limit: %r",
+                    self.name,
+                    key,
+                )
+                continue
+            routes[key] = text
+        return routes
+
+    async def _handle_callback_text_route(
+        self,
+        query: Any,
+        data: str,
+        query_chat_id: Any,
+        query_chat_type: Any,
+        query_thread_id: Any,
+        query_user_name: Any,
+    ) -> None:
+        """Route configured callback_data to a normal text MessageEvent."""
+        resolved_text = self._callback_text_routes.get(data)
+        if resolved_text is None:
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this button.")
+            return
+
+        await query.answer()
+        if not query.message:
+            logger.warning("[%s] Callback text route %r has no source message; dropping", self.name, data)
+            return
+
+        user_display = getattr(query.from_user, "first_name", None) or "User"
+        try:
+            original_text = query.message.text or ""
+            await query.edit_message_text(
+                text=(
+                    f"{_html.escape(original_text)}\n\n"
+                    f"<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            logger.debug("[%s] Callback text route message edit failed (non-fatal): %s", self.name, exc)
+
+        try:
+            from types import SimpleNamespace
+
+            callback_message = SimpleNamespace(
+                chat=query.message.chat,
+                from_user=query.from_user,
+                text=resolved_text,
+                message_id=getattr(query.message, "message_id", None),
+                message_thread_id=getattr(query.message, "message_thread_id", None),
+                is_topic_message=getattr(query.message, "is_topic_message", False),
+                reply_to_message=None,
+                quote=None,
+                date=datetime.now(timezone.utc),
+                forum_topic_created=None,
+            )
+            event = self._build_message_event(callback_message, MessageType.TEXT)
+            event = self._apply_telegram_group_observe_attribution(event)
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.error("[%s] Callback text route failed: %s", self.name, exc, exc_info=True)
 
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):
@@ -6154,82 +6253,6 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
-        # --- Harunyang recurring-log callbacks (haru_log:kind:choice) ---
-        if data.startswith("haru_log:"):
-            parts = data.split(":", 2)
-            if len(parts) != 3:
-                await query.answer(text="Invalid Haru log data.")
-                return
-
-            kind, choice = parts[1], parts[2]
-            caller_id = str(getattr(query.from_user, "id", ""))
-            if not self._is_callback_user_authorized(
-                caller_id,
-                chat_id=query_chat_id,
-                chat_type=str(query_chat_type) if query_chat_type is not None else None,
-                thread_id=str(query_thread_id) if query_thread_id is not None else None,
-                user_name=query_user_name,
-            ):
-                await query.answer(text="⛔ You are not authorized to answer this prompt.")
-                return
-
-            callback_texts = {
-                ("breakfast", "default"): "응, 기본 먹었어 ✅",
-                ("breakfast", "custom"): "다르게 먹었어 ✏️",
-            }
-            resolved_text = callback_texts.get((kind, choice))
-            if not resolved_text:
-                await query.answer(text="Unknown Haru log action.")
-                return
-
-            await query.answer(text="✓ 확인했어")
-            user_display = getattr(query.from_user, "first_name", "User")
-            try:
-                original_text = (query.message.text or "") if query.message else ""
-                await query.edit_message_text(
-                    text=f"{_html.escape(original_text)}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}",
-                    parse_mode="HTML",
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
-
-            if not query.message:
-                return
-
-            # Convert the callback into a normal text MessageEvent so existing
-            # skills/logging flows handle it exactly like TJ typed the button
-            # label, without leaving a persistent Telegram reply keyboard.
-            try:
-                from types import SimpleNamespace
-
-                callback_message = SimpleNamespace(
-                    chat=query.message.chat,
-                    from_user=query.from_user,
-                    text=resolved_text,
-                    message_id=getattr(query.message, "message_id", None),
-                    message_thread_id=getattr(query.message, "message_thread_id", None),
-                    is_topic_message=getattr(query.message, "is_topic_message", False),
-                    reply_to_message=None,
-                    quote=None,
-                    date=datetime.now(timezone.utc),
-                    forum_topic_created=None,
-                )
-                event = self._build_message_event(callback_message, MessageType.TEXT)
-                event = self._apply_telegram_group_observe_attribution(event)
-                await self.handle_message(event)
-            except Exception as exc:
-                logger.error("[%s] Haru log callback failed: %s", self.name, exc, exc_info=True)
-                try:
-                    if self._bot is not None:
-                        await self._bot.send_message(
-                            chat_id=int(query.message.chat_id),
-                            text="버튼 처리가 실패했어. 같은 문구를 채팅으로 한번만 보내줘 🙏",
-                        )
-                except Exception:
-                    pass
-            return
-
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -6533,6 +6556,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
+            await self._handle_callback_text_route(
+                query,
+                data,
+                query_chat_id,
+                query_chat_type,
+                query_thread_id,
+                query_user_name,
+            )
             return
         answer = data.split(":", 1)[1]  # "y" or "n"
         caller_id = str(getattr(query.from_user, "id", ""))
