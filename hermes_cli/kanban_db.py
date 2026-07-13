@@ -5937,6 +5937,14 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
+        # Auto-decompose does not run through kanban_tools._maybe_auto_subscribe:
+        # it creates child rows directly in this transaction, outside any
+        # gateway session context. Inherit the root's subscribers explicitly so
+        # child completion/block events reach the same requester. Keeping this
+        # inside the decomposition transaction makes graph creation and
+        # notification routing atomic — no successfully-created child can be
+        # left silently unsubscribed because a later bookkeeping step failed.
+
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
@@ -5987,6 +5995,18 @@ def decompose_triage_task(
             _append_event(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO kanban_notify_subs
+                    (task_id, platform, chat_id, thread_id, user_id,
+                     notifier_profile, created_at, last_event_id)
+                SELECT ?, platform, chat_id, thread_id, user_id,
+                       notifier_profile, ?, 0
+                  FROM kanban_notify_subs
+                 WHERE task_id = ?
+                """,
+                (new_id, now, task_id),
             )
             child_ids.append(new_id)
 

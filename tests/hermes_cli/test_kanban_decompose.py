@@ -106,11 +106,73 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         root = kb.get_task(conn, tid)
         c0 = kb.get_task(conn, outcome.child_ids[0])
         c1 = kb.get_task(conn, outcome.child_ids[1])
+        child_subs = [kb.list_notify_subs(conn, cid) for cid in outcome.child_ids]
     assert root.status == "todo"
     assert c0.status == "ready"
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+    assert child_subs == [[], []]
+
+
+def test_decompose_fanout_inherits_root_notify_subscriptions(kanban_home):
+    """Every auto-decomposed child should notify the root's requester."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-root",
+            thread_id="2",
+            user_id="creator",
+            notifier_profile="orchestrator",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="chat-secondary",
+            user_id="owner-2",
+            notifier_profile="daily",
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
+            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect() as conn:
+        child_subs = [kb.list_notify_subs(conn, cid) for cid in outcome.child_ids]
+
+    for subs in child_subs:
+        by_platform = {sub["platform"]: sub for sub in subs}
+        assert set(by_platform) == {"telegram", "discord"}
+        assert by_platform["telegram"]["chat_id"] == "chat-root"
+        assert by_platform["telegram"]["thread_id"] == "2"
+        assert by_platform["telegram"]["user_id"] == "creator"
+        assert by_platform["telegram"]["notifier_profile"] == "orchestrator"
+        assert by_platform["discord"]["chat_id"] == "chat-secondary"
+        assert by_platform["discord"]["thread_id"] == ""
+        assert by_platform["discord"]["user_id"] == "owner-2"
+        assert by_platform["discord"]["notifier_profile"] == "daily"
+        assert all(int(sub["last_event_id"]) == 0 for sub in subs)
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):

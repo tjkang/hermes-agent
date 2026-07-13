@@ -451,6 +451,51 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_notifier_named_active_profile_uses_primary_adapter(tmp_path, monkeypatch):
+    """A standalone named-profile gateway owns ``self.adapters`` too.
+
+    ``_profile_adapters`` contains only secondary profiles. Treating every
+    non-default owner as secondary makes a standalone ``orchestrator`` gateway
+    rewind its own notification forever instead of sending it.
+    """
+    db_path = tmp_path / "named-active-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by orchestrator", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-orchestrator",
+            notifier_profile="orchestrator",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    setattr(runner, "adapters", {Platform.TELEGRAM: adapter})
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "orchestrator"
+    runner._active_profile_name = lambda: "orchestrator"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
 def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypatch):
     """A subscription owned by a secondary profile whose profile-adapter
     registry entry EXISTS but lacks this platform must NOT fall back to the
