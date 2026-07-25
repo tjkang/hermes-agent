@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_managed_policy: tuple = ()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -323,15 +324,28 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
+    global _skill_commands, _skill_commands_platform, _skill_commands_managed_policy
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import (
+            get_external_skills_dirs,
+            get_managed_skill_allowlists,
+            get_managed_skill_policies,
+            is_managed_skill_allowed,
+            is_managed_skill_name,
+            is_managed_skill_source_allowed,
+            iter_skill_index_files,
+            managed_skill_allowlists_fingerprint,
+        )
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
+        managed_allowlists = get_managed_skill_allowlists()
+        managed_policies = get_managed_skill_policies()
+        _skill_commands_managed_policy = managed_skill_allowlists_fingerprint()
         seen_names: set = set()
+        managed_collisions: set = set()
 
         # Scan local dir first, then external dirs
         dirs_to_scan = []
@@ -354,7 +368,21 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     if not skill_matches_environment(frontmatter):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
+                    if (
+                        not is_managed_skill_allowed(name, managed_allowlists)
+                        or not is_managed_skill_allowed(skill_md.parent.name, managed_allowlists)
+                        or not is_managed_skill_source_allowed(name, skill_md, managed_policies)
+                        or not is_managed_skill_source_allowed(skill_md.parent.name, skill_md, managed_policies)
+                    ):
+                        continue
+                    if name in managed_collisions:
+                        continue
                     if name in seen_names:
+                        if is_managed_skill_name(name, managed_allowlists):
+                            managed_collisions.add(name)
+                            for command, details in list(_skill_commands.items()):
+                                if details.get("name") == name:
+                                    _skill_commands.pop(command, None)
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
@@ -420,9 +448,12 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536).
     """
+    from agent.skill_utils import managed_skill_allowlists_fingerprint
+
     if (
         not _skill_commands
         or _skill_commands_platform != _resolve_skill_commands_platform()
+        or _skill_commands_managed_policy != managed_skill_allowlists_fingerprint()
     ):
         scan_skill_commands()
     return _skill_commands

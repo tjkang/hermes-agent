@@ -82,7 +82,13 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    get_managed_skill_allowlists,
+    get_managed_skill_policies,
+    is_managed_skill_allowed,
+    is_managed_skill_name,
+    is_managed_skill_source_allowed,
     is_skill_support_path as _is_skill_support_path,
+    managed_skill_allowlists_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,7 +139,12 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (
+        tuple(sig),
+        frozenset(disabled),
+        managed_skill_allowlists_fingerprint(),
+        platform,
+    )
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -688,6 +699,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
+    managed_allowlists = get_managed_skill_allowlists()
+    managed_policies = get_managed_skill_policies()
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -714,6 +727,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     skills = []
     seen_names: set = set()
+    managed_collisions: set = set()
 
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
@@ -735,7 +749,19 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                if (
+                    not is_managed_skill_allowed(name, managed_allowlists)
+                    or not is_managed_skill_allowed(skill_dir.name, managed_allowlists)
+                    or not is_managed_skill_source_allowed(name, skill_md, managed_policies)
+                    or not is_managed_skill_source_allowed(skill_dir.name, skill_md, managed_policies)
+                ):
+                    continue
+                if name in managed_collisions:
+                    continue
                 if name in seen_names:
+                    if is_managed_skill_name(name, managed_allowlists):
+                        managed_collisions.add(name)
+                        skills = [skill for skill in skills if skill.get("name") != name]
                     continue
                 if name in disabled:
                     continue
@@ -891,6 +917,28 @@ def _serve_plugin_skill(
     except Exception:
         pass
 
+    resolved_plugin_name = str(parsed_frontmatter.get("name") or bare)
+    if (
+        not is_managed_skill_allowed(bare)
+        or not is_managed_skill_allowed(resolved_plugin_name)
+        or not is_managed_skill_source_allowed(
+            bare, skill_md, require_source_binding=True
+        )
+        or not is_managed_skill_source_allowed(
+            resolved_plugin_name, skill_md, require_source_binding=True
+        )
+    ):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Skill '{namespace}:{bare}' is blocked by the managed allowlist "
+                    "for its reserved namespace."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
             {
@@ -991,6 +1039,26 @@ def skill_view(
                     "success": False,
                     "error": lookup_error,
                     "hint": "Use a skill name or relative path within the skills directory.",
+                },
+                ensure_ascii=False,
+            )
+
+        managed_lookup_name = (
+            name.split(":", 1)[1]
+            if ":" in name
+            else PurePosixPath(name.replace("\\", "/")).name
+        )
+        if (
+            not is_managed_skill_allowed(name)
+            or not is_managed_skill_allowed(managed_lookup_name)
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' is blocked by the managed allowlist "
+                        "for its reserved namespace."
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -1277,6 +1345,22 @@ def skill_view(
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
+        if (
+            not is_managed_skill_allowed(resolved_name)
+            or not is_managed_skill_allowed(skill_md.parent.name)
+            or not is_managed_skill_source_allowed(resolved_name, skill_md)
+            or not is_managed_skill_source_allowed(skill_md.parent.name, skill_md)
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{resolved_name}' is blocked by the managed allowlist "
+                        "for its reserved namespace."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         if _is_skill_disabled(resolved_name):
             return json.dumps(
                 {

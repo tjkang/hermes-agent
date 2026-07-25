@@ -2475,6 +2475,12 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Optional positive allowlists for managed skill namespaces. A skill
+        # whose name starts with a configured prefix is visible and loadable
+        # only when its full name appears in that prefix's list. This closes
+        # broad external_dirs for a narrow managed namespace without hiding
+        # unrelated user skills.
+        "managed_allowlists": {},  # e.g. {"content-factory-": ["content-factory-ops"]}
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -8896,15 +8902,20 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-def set_config_value(key: str, value: str, force: bool = False):
+def set_config_value(
+    key: str,
+    value: str,
+    force: bool = False,
+    *,
+    parse_json: bool = False,
+):
     """Set a configuration value.
 
     Args:
         key: Dotted config path (e.g. ``terminal.backend``).
-        value: String value (auto-coerced to bool/int/float when matching).
-        force: When True, skip the unknown-key warning — useful for scripted
-            writes of keys the running version doesn't recognize yet. The CLI
-            exposes this via ``hermes config set --force``.
+        value: String value (or JSON text when ``parse_json`` is true).
+        force: Skip the unknown-key warning for scripted custom keys.
+        parse_json: Decode the value as JSON for structured config writes.
     """
     if is_managed():
         managed_error("set configuration values")
@@ -8927,6 +8938,9 @@ def set_config_value(key: str, value: str, force: bool = False):
         sys.exit(1)
     # Check if it's an API key (goes to .env)
     if _is_env_config_key(key):
+        if parse_json:
+            print("--json is only supported for config.yaml values", file=sys.stderr)
+            sys.exit(2)
         # Unified lifecycle: also rotates any config.yaml mirror of the old
         # value so a stale higher-precedence copy can't win (#62269).
         from hermes_cli.credential_lifecycle import save_provider_env_credential
@@ -8962,19 +8976,26 @@ def set_config_value(key: str, value: str, force: bool = False):
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
-    # Preserve values for string-typed settings.  In particular, enum members
-    # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
-    # retain the historical best-effort coercion behavior.
-    coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
-            coerced_value = True
-        elif value.lower() in {'false', 'no', 'off'}:
-            coerced_value = False
-        elif value.isdigit():
-            coerced_value = int(value)
-        elif value.replace('.', '', 1).isdigit():
-            coerced_value = float(value)
+    # JSON mode is explicit. Otherwise preserve declared string settings while
+    # retaining the historical best-effort coercion for non-string leaves and
+    # unknown keys.
+    if parse_json:
+        try:
+            coerced_value: Any = json.loads(value)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON config value: {exc.msg}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        coerced_value = value
+        if not isinstance(_default_value_for_key(key), str):
+            if value.lower() in {'true', 'yes', 'on'}:
+                coerced_value = True
+            elif value.lower() in {'false', 'no', 'off'}:
+                coerced_value = False
+            elif value.isdigit():
+                coerced_value = int(value)
+            elif value.replace('.', '', 1).isdigit():
+                coerced_value = float(value)
 
     value = coerced_value
     _set_nested(user_config, key, value)
@@ -9016,7 +9037,11 @@ def set_config_value(key: str, value: str, force: bool = False):
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
     _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+    if parse_json:
+        # JSON mode can replace an arbitrarily nested object. Never echo it:
+        # credential-shaped descendants would bypass the leaf-key masker.
+        _display_value = "<JSON value>"
+    elif _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
         from agent.redact import mask_secret
         _display_value = mask_secret(value)
     else:
@@ -9145,7 +9170,7 @@ def config_command(args):
         value = getattr(args, 'value', None)
         force = bool(getattr(args, 'force', False))
         if not key or value is None:
-            print("Usage: hermes config set [--force] <key> <value>")
+            print("Usage: hermes config set [--force] [--json] <key> <value>")
             print()
             print("Examples:")
             print("  hermes config set model anthropic/claude-sonnet-4")
@@ -9154,7 +9179,8 @@ def config_command(args):
             print()
             print("  --force: skip the unknown-key notice for unrecognized keys")
             sys.exit(1)
-        set_config_value(key, value, force=force)
+        parse_json = bool(getattr(args, "parse_json", False))
+        set_config_value(key, value, force=force, parse_json=parse_json)
 
     elif subcmd == "unset":
         key = getattr(args, 'key', None)
