@@ -2316,6 +2316,12 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Optional positive allowlists for managed skill namespaces. A skill
+        # whose name starts with a configured prefix is visible and loadable
+        # only when its full name appears in that prefix's list. This closes
+        # broad external_dirs for a narrow managed namespace without hiding
+        # unrelated user skills.
+        "managed_allowlists": {},  # e.g. {"content-factory-": ["content-factory-ops"]}
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -8097,7 +8103,7 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
-def set_config_value(key: str, value: str):
+def set_config_value(key: str, value: str, *, parse_json: bool = False):
     """Set a configuration value."""
     if is_managed():
         managed_error("set configuration values")
@@ -8131,7 +8137,15 @@ def set_config_value(key: str, value: str):
         'GITHUB_TOKEN', 'HONCHO_API_KEY',
     ]
     
-    if key.upper() in api_keys or key.upper().endswith(('_API_KEY', '_TOKEN')) or key.upper().startswith('TERMINAL_SSH'):
+    routes_to_env = (
+        key.upper() in api_keys
+        or key.upper().endswith(('_API_KEY', '_TOKEN'))
+        or key.upper().startswith('TERMINAL_SSH')
+    )
+    if parse_json and routes_to_env:
+        print("--json is only supported for config.yaml values", file=sys.stderr)
+        sys.exit(2)
+    if routes_to_env:
         save_env_value(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return
@@ -8154,8 +8168,15 @@ def set_config_value(key: str, value: str):
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
-    # Convert value to appropriate type
-    if value.lower() in {'true', 'yes', 'on'}:
+    # Convert value to appropriate type. JSON mode is explicit so existing
+    # string-valued config commands keep their historical behavior.
+    if parse_json:
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON config value: {exc.msg}", file=sys.stderr)
+            sys.exit(2)
+    elif value.lower() in {'true', 'yes', 'on'}:
         value = True
     elif value.lower() in {'false', 'no', 'off'}:
         value = False
@@ -8190,7 +8211,11 @@ def set_config_value(key: str, value: str):
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
     _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+    if parse_json:
+        # JSON mode can replace an arbitrarily nested object. Never echo it:
+        # credential-shaped descendants would bypass the leaf-key masker.
+        _display_value = "<JSON value>"
+    elif _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
         from agent.redact import mask_secret
         _display_value = mask_secret(value)
     else:
@@ -8223,7 +8248,7 @@ def config_command(args):
             print("  hermes config set terminal.backend docker")
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
-        set_config_value(key, value)
+        set_config_value(key, value, parse_json=bool(getattr(args, "parse_json", False)))
     
     elif subcmd == "path":
         print(get_config_path())

@@ -30,6 +30,12 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config set
     config_set = config_subparsers.add_parser("set", help="Set a configuration value")
     config_set.add_argument(
+        "--json",
+        dest="parse_json",
+        action="store_true",
+        help="Parse VALUE as JSON and replace the target node atomically",
+    )
+    config_set.add_argument(
         "key", nargs="?", help="Configuration key (e.g., model, terminal.backend)"
     )
     config_set.add_argument("value", nargs="?", help="Value to set")

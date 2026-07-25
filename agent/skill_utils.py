@@ -311,7 +311,8 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_RAW_CONFIG_ERROR_KEY = object()
+_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[Any, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -319,7 +320,7 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-def _load_raw_config() -> Dict[str, Any]:
+def _load_raw_config() -> Dict[Any, Any]:
     """Read config.yaml with a shared mtime+size keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
@@ -344,9 +345,9 @@ def _load_raw_config() -> Dict[str, Any]:
         parsed = yaml_load(config_path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
-        return {}
+        parsed = {_RAW_CONFIG_ERROR_KEY: True}
     if not isinstance(parsed, dict):
-        return {}
+        parsed = {_RAW_CONFIG_ERROR_KEY: True}
 
     if cache_key is not None:
         _RAW_CONFIG_CACHE.clear()
@@ -397,7 +398,129 @@ def _normalize_string_set(values) -> Set[str]:
         return set()
     if isinstance(values, str):
         values = [values]
+    elif not isinstance(values, (list, tuple, set, frozenset)):
+        return set()
     return {str(v).strip() for v in values if str(v).strip()}
+
+
+def get_managed_skill_policies() -> Dict[str, Dict[str, Optional[str]]]:
+    """Return managed names and optional exact source paths by prefix.
+
+    A string or sequence allows names from any configured skill root. A mapping
+    binds every key to one exact ``SKILL.md`` path. Malformed values are an
+    empty policy, which keeps the configured prefix fail-closed.
+    """
+    parsed = _load_raw_config()
+    if parsed.get(_RAW_CONFIG_ERROR_KEY):
+        # A present-but-unreadable config cannot prove that a reserved prefix
+        # is safe. Match every name with an empty policy until the operator
+        # repairs the file instead of silently dropping the security boundary.
+        return {"": {}}
+    if "skills" not in parsed:
+        return {}
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return {"": {}}
+    if "managed_allowlists" not in skills_cfg:
+        return {}
+    raw = skills_cfg.get("managed_allowlists")
+    if not isinstance(raw, dict):
+        return {"": {}}
+
+    result: Dict[str, Dict[str, Optional[str]]] = {}
+    for raw_prefix, raw_allowed in raw.items():
+        prefix = str(raw_prefix).strip()
+        if not prefix:
+            continue
+        policy: Dict[str, Optional[str]] = {}
+        if isinstance(raw_allowed, dict):
+            for raw_name, raw_source in raw_allowed.items():
+                name = str(raw_name).strip()
+                if not name or not isinstance(raw_source, str) or not raw_source.strip():
+                    continue
+                expanded = os.path.expanduser(os.path.expandvars(raw_source.strip()))
+                source = Path(expanded)
+                if not source.is_absolute():
+                    source = get_skills_dir().parent / source
+                policy[name] = str(source.resolve())
+        else:
+            for name in _normalize_string_set(raw_allowed):
+                policy[name] = None
+        result[prefix] = policy
+    return result
+
+
+def get_managed_skill_allowlists() -> Dict[str, frozenset[str]]:
+    """Return configured positive name allowlists keyed by reserved prefix."""
+    return {
+        prefix: frozenset(policy)
+        for prefix, policy in get_managed_skill_policies().items()
+    }
+
+
+def is_managed_skill_allowed(
+    name: str,
+    allowlists: Optional[Dict[str, frozenset[str]]] = None,
+) -> bool:
+    """Return whether *name* passes every matching managed-prefix policy."""
+    normalized = str(name or "").strip()
+    policies = get_managed_skill_allowlists() if allowlists is None else allowlists
+    matching = [allowed for prefix, allowed in policies.items() if normalized.startswith(prefix)]
+    return not matching or all(normalized in allowed for allowed in matching)
+
+
+def is_managed_skill_name(
+    name: str,
+    allowlists: Optional[Dict[str, frozenset[str]]] = None,
+) -> bool:
+    """Return whether *name* belongs to any configured managed namespace."""
+    normalized = str(name or "").strip()
+    policies = get_managed_skill_allowlists() if allowlists is None else allowlists
+    return any(normalized.startswith(prefix) for prefix in policies)
+
+
+def is_managed_skill_source_allowed(
+    name: str,
+    skill_path: Optional[Path],
+    policies: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+    *,
+    require_source_binding: bool = False,
+) -> bool:
+    """Return whether a managed skill comes from every configured exact source."""
+    normalized = str(name or "").strip()
+    active = get_managed_skill_policies() if policies is None else policies
+    matching = [policy for prefix, policy in active.items() if normalized.startswith(prefix)]
+    if not matching:
+        return True
+    for policy in matching:
+        if normalized not in policy:
+            return False
+        expected = policy[normalized]
+        if expected is None:
+            if require_source_binding:
+                return False
+            continue
+        if skill_path is None:
+            return False
+        try:
+            if str(Path(skill_path).resolve()) != expected:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def managed_skill_allowlists_fingerprint() -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """Stable cache-key representation of the active managed allowlists."""
+    return tuple(
+        sorted(
+            (
+                prefix,
+                tuple(sorted(f"{name}={source or ''}" for name, source in policy.items())),
+            )
+            for prefix, policy in get_managed_skill_policies().items()
+        )
+    )
 
 
 # ── External skills directories ──────────────────────────────────────────
