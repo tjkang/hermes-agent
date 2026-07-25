@@ -1,10 +1,12 @@
 """Tests for set_config_value — verifying secrets route to .env and config to config.yaml."""
 
 import argparse
+import json
 import os
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from hermes_cli.config import set_config_value, config_command
 
@@ -123,6 +125,46 @@ class TestConfigYamlRouting:
             "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true" in env_content
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
+
+    def test_json_mode_atomically_replaces_a_mapping(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "skills:\n"
+            "  managed_allowlists:\n"
+            "    content-factory-:\n"
+            "      content-factory-dispatch: /old/dispatch/SKILL.md\n"
+            "      content-factory-canary: /stale/canary/SKILL.md\n",
+            encoding="utf-8",
+        )
+        exact = {
+            "content-factory-dispatch": "/new/dispatch/SKILL.md",
+        }
+
+        set_config_value(
+            "skills.managed_allowlists.content-factory-",
+            json.dumps(exact),
+            parse_json=True,
+        )
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["skills"]["managed_allowlists"]["content-factory-"] == exact
+
+    def test_json_mode_never_echoes_nested_secret_values(
+        self,
+        _isolated_hermes_home,
+        capsys,
+    ):
+        secret = "sk-review-secret-must-not-echo"
+
+        set_config_value(
+            "model",
+            json.dumps({"api_key": secret, "provider": "custom"}),
+            parse_json=True,
+        )
+
+        captured = capsys.readouterr()
+        assert secret not in captured.out
+        assert secret not in captured.err
+        assert "<JSON value>" in captured.out
 
 
 # ---------------------------------------------------------------------------

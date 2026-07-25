@@ -24,7 +24,13 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_managed_skill_allowlists,
+    get_managed_skill_policies,
+    is_managed_skill_allowed,
+    is_managed_skill_name,
+    is_managed_skill_source_allowed,
     iter_skill_index_files,
+    managed_skill_allowlists_fingerprint,
     parse_frontmatter,
     skill_matches_environment,
     skill_matches_platform,
@@ -1323,7 +1329,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1426,6 +1432,7 @@ def _build_snapshot_entry(
 
     return {
         "skill_name": skill_name,
+        "source_path": str(rel_path),
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
@@ -1547,6 +1554,8 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    managed_allowlists = get_managed_skill_allowlists()
+    managed_policies = get_managed_skill_policies()
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1554,6 +1563,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        managed_skill_allowlists_fingerprint(),
         tuple(sorted(compact_categories or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -1576,10 +1586,19 @@ def build_skills_system_prompt(
             skill_name = entry.get("skill_name") or ""
             category = entry.get("category") or "general"
             frontmatter_name = entry.get("frontmatter_name") or skill_name
+            source_path = entry.get("source_path")
+            resolved_source = skills_dir / source_path if source_path else None
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
+                continue
+            if (
+                not is_managed_skill_allowed(frontmatter_name, managed_allowlists)
+                or not is_managed_skill_allowed(skill_name, managed_allowlists)
+                or not is_managed_skill_source_allowed(frontmatter_name, resolved_source, managed_policies)
+                or not is_managed_skill_source_allowed(skill_name, resolved_source, managed_policies)
+            ):
                 continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
@@ -1605,6 +1624,13 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if (
+                not is_managed_skill_allowed(entry["frontmatter_name"], managed_allowlists)
+                or not is_managed_skill_allowed(skill_name, managed_allowlists)
+                or not is_managed_skill_source_allowed(entry["frontmatter_name"], skill_file, managed_policies)
+                or not is_managed_skill_source_allowed(skill_name, skill_file, managed_policies)
+            ):
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1642,9 +1668,15 @@ def build_skills_system_prompt(
     # and typically small).  Local skills already in skills_by_category take
     # precedence: we track seen names and skip duplicates from external dirs.
     seen_skill_names: set[str] = set()
+    managed_name_counts: dict[str, int] = {}
     for cat_skills in skills_by_category.values():
         for name, _desc in cat_skills:
             seen_skill_names.add(name)
+            if is_managed_skill_name(name, managed_allowlists):
+                managed_name_counts[name] = managed_name_counts.get(name, 0) + 1
+    managed_collisions = {
+        name for name, count in managed_name_counts.items() if count > 1
+    }
 
     for ext_dir in external_dirs:
         if not ext_dir.exists():
@@ -1658,8 +1690,17 @@ def build_skills_system_prompt(
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
+                    if is_managed_skill_name(frontmatter_name, managed_allowlists):
+                        managed_collisions.add(frontmatter_name)
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if (
+                    not is_managed_skill_allowed(frontmatter_name, managed_allowlists)
+                    or not is_managed_skill_allowed(skill_name, managed_allowlists)
+                    or not is_managed_skill_source_allowed(frontmatter_name, skill_file, managed_policies)
+                    or not is_managed_skill_source_allowed(skill_name, skill_file, managed_policies)
+                ):
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),
@@ -1687,6 +1728,15 @@ def build_skills_system_prompt(
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
+
+    if managed_collisions:
+        for category in list(skills_by_category):
+            skills_by_category[category] = [
+                item for item in skills_by_category[category]
+                if item[0] not in managed_collisions
+            ]
+            if not skills_by_category[category]:
+                skills_by_category.pop(category)
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
